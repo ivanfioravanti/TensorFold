@@ -79,6 +79,8 @@ _GATHER_BODY = """
       Xs, Ws, X, W, S, B, IDX, Y, MM[0], NN[0], KK[0],
       threadgroup_position_in_grid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """
+# MLX 0.32.3 hands the gather kernel each expert's first row and the expert count; 0.32.2 a row's expert
+_GATHER_BODY_OFFSETS = _GATHER_BODY.replace("MM[0], NN[0], KK[0],\n", "MM[0], NN[0], KK[0], GG[0],\n")
 _kernels: dict[str, Any] = {}
 
 
@@ -229,17 +231,40 @@ def linear(layer: Any, x: mx.array) -> mx.array:
     return y.reshape(*lead, y.shape[-1])
 
 
+def _gather_by_offsets() -> bool:
+    with open(os.path.join(_INCLUDE, "mlx/backend/metal/kernels/quantized.h")) as f:
+        src = f.read()
+    return "affine_gather_qmm_rhs(" in src and "offsets, num_groups" in src
+
+
+_offsets_form: list[bool] = []
+
+
 def gather_sorted(x: mx.array, w: mx.array, scales: mx.array, biases: mx.array, idx: mx.array) -> mx.array:
     """x [M, K] bf16 with rows sorted by expert, idx [M] uint32 (sorted) -> [M, N]: row i times expert idx[i]."""
 
     m, k = x.shape
     n = int(w.shape[1])
     bm, bn, wm, wn = 16, 32, 1, 2
-    kern = _k("tf_prefill_gather_qmm", _GATHER_BODY, ["X", "W", "S", "B", "IDX", "MM", "NN", "KK"], ["Y"], _header())
-    return kern(inputs=[x, w, scales, biases, idx, _int(m), _int(n), _int(k)],
+    if not _offsets_form:
+        _offsets_form.append(_gather_by_offsets())
+    if _offsets_form[0]:
+        groups = int(w.shape[0])
+        counts = mx.zeros((groups,), dtype=mx.int32).at[idx.astype(mx.int32)].add(1)
+        starts = (mx.cumsum(counts) - counts).astype(mx.int32)
+        kern = _k("tf_prefill_gather_qmm_offsets", _GATHER_BODY_OFFSETS,
+                  ["X", "W", "S", "B", "IDX", "MM", "NN", "KK", "GG"], ["Y"], _header())
+        args = [x, w, scales, biases, starts, _int(m), _int(n), _int(k), _int(groups)]
+        tiles_m = -(-m // bm) + groups  # each expert's rows tile on their own: a partial tile per expert at most
+    else:
+        kern = _k("tf_prefill_gather_qmm", _GATHER_BODY, ["X", "W", "S", "B", "IDX", "MM", "NN", "KK"], ["Y"],
+                  _header())
+        args = [x, w, scales, biases, idx, _int(m), _int(n), _int(k)]
+        tiles_m = -(-m // bm)
+    return kern(inputs=args,
                 template=[("BM", bm), ("BN", bn), ("BK", 32), ("WM", wm), ("WN", wn),
                           ("AM", int(m % bm == 0)), ("AN", int(n % bn == 0)), ("AK", int(k % 32 == 0))],
-                grid=(-(-n // bn) * 32, -(-m // bm) * wn, wm), threadgroup=(32, wn, wm),
+                grid=(-(-n // bn) * 32, tiles_m * wn, wm), threadgroup=(32, wn, wm),
                 output_shapes=[(m, n)], output_dtypes=[mx.bfloat16])[0]
 
 
